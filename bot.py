@@ -1,143 +1,141 @@
-# bot.py
-import random
-import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, ConversationHandler
+import os
+import threading
+import time
+from telegram import ParseMode, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# === CONFIG ===
-TOKEN = "8638849486:AAHvSkkd1Gt4oy_PbQb7Q_0wD-JyWoHD3MA"  # Remplace par ton token Telegram
-MAX_POINTS = 20
+# Token du bot (mettre en variable d'environnement)
+TOKEN = os.environ.get("TOKEN").strip()
 
-# === LOGGING ===
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Durées en secondes
+JOIN_PHASE_TIME = 120  # 2 minutes pour rejoindre
+DAY_PHASE_TIME = 60
+DEFENSE_PHASE_TIME = 45
+LYNCH_PHASE_TIME = 45
 
-# === ROLES ===
-roles_ville = [
-    {"name": "Président d’État", "type": "ville", "action": "élimine la secte", "price": 10},
-    {"name": "Juge suprême", "type": "ville", "action": "bloque une action", "price": 6},
-    {"name": "Ministre de la défense", "type": "ville", "action": "protège un joueur", "price": 5},
-    {"name": "Chef de la police", "type": "ville", "action": "coordonne les enquêtes", "price": 5},
-    {"name": "Médecin en chef", "type": "ville", "action": "sauve un rôle clé", "price": 5},
-    {"name": "Détective", "type": "ville", "action": "observe un joueur", "price": 4},
-    {"name": "Enquêteur", "type": "ville", "action": "découvre un rôle", "price": 4},
-    {"name": "Homme blindé", "type": "ville", "action": "protège un joueur", "price": 3},
-    {"name": "Citoyen vigilant", "type": "ville", "action": "observe la journée", "price": 2},
-    {"name": "Simple civil", "type": "ville", "action": None, "price": 0},
-    {"name": "Clochard", "type": "ville", "action": None, "price": 0},
-    {"name": "Secte Mashiil", "type": "ville", "action": "convertit les civils", "price": 4}
-]
+# Exemple de rôles
+ROLES = {
+    "Président": "Dirige la ville et peut protéger certains civils.",
+    "Détective": "Peut enquêter sur un joueur chaque nuit.",
+    "Chef de gang": "Peut convertir un civil à son camp (35% chance).",
+    "Simple Civil": "Pas d’action, juste survivre.",
+    "Secte": "Peut recruter des civils, meurt si va chez un bad."
+}
 
-roles_bads = [
-    {"name": "Chef de gang", "type": "bad", "action": "attaque ou convertit 35%", "price": 8},
-    {"name": "Tueur en série", "type": "bad", "action": "tue un joueur", "price": 6},
-    {"name": "Assassin", "type": "bad", "action": "bloque et tue", "price": 6},
-    {"name": "Criminel", "type": "bad", "action": "soutient les attaques", "price": 5},
-    {"name": "Pyromane", "type": "bad", "action": "attaque aléatoire", "price": 5},
-    {"name": "Espion criminel", "type": "bad", "action": "connaît la cible", "price": 4},
-    {"name": "Voleur", "type": "bad", "action": "échange de rôle", "price": 4},
-    {"name": "Corrompu", "type": "bad", "action": "influence vote", "price": 3},
-    {"name": "Maître du temps", "type": "bad", "action": "avantage de temps", "price": 4},
-    {"name": "Saboteur", "type": "bad", "action": "empêche actions civiques", "price": 3},
-    {"name": "Vexé", "type": "bad", "action": "lynchage automatique", "price": 5}
-]
+# Stockage des joueurs et de leurs rôles
+players = {}  # user_id -> {"name": str, "role": str, "points": int}
+join_timer_active = False
+join_timer_thread = None
 
-# === JOUEURS ===
-players = {}  # player_id : {name, role, points, tickets, alive}
-game_started = False
-day_count = 0
+# ---------------- COMMANDES ---------------- #
 
-# === COMMANDES DE BASE ===
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("Bienvenue dans Undercover ! Tapez /join_game pour rejoindre la partie.")
+    update.message.reply_text(
+        "Bienvenue dans Undercover! Utilise /join pour rejoindre la partie.\n"
+        "Le timer pour rejoindre est de 2 minutes. Une fois 6 joueurs minimum, on peut forcer le début."
+    )
 
-def join_game(update: Update, context: CallbackContext):
+def join(update: Update, context: CallbackContext):
     user_id = update.message.from_user.id
-    if user_id not in players:
-        players[user_id] = {"name": update.message.from_user.first_name, "role": None, "points": 0, "tickets": 0, "alive": True}
-        update.message.reply_text(f"{update.message.from_user.first_name} a rejoint la partie !")
+    name = update.message.from_user.first_name
+    if user_id in players:
+        update.message.reply_text("Tu as déjà rejoint la partie!")
     else:
-        update.message.reply_text("Vous êtes déjà dans la partie.")
+        players[user_id] = {"name": name, "role": None, "points": 0}
+        update.message.reply_text(f"{name} a rejoint la partie! Joueurs totaux: {len(players)}")
 
-# === ATTRIBUTION DES RÔLES ===
+def rolelist(update: Update, context: CallbackContext):
+    msg = "*Liste des rôles :*\n"
+    for role, desc in ROLES.items():
+        msg += f"• *{role}* : {desc}\n"
+    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+def setlanguage(update: Update, context: CallbackContext):
+    if context.args:
+        lang = context.args[0].lower()
+        update.message.reply_text(f"Langue changée en {lang}")
+    else:
+        update.message.reply_text("Usage: /setlanguage <fr/en>")
+
+def myrole(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id in players and players[user_id]["role"]:
+        update.message.reply_text(f"Ton rôle est : {players[user_id]['role']}")
+    else:
+        update.message.reply_text("Tu n'as pas encore reçu de rôle.")
+
+def points(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id in players:
+        update.message.reply_text(f"Tu as {players[user_id]['points']} points.")
+    else:
+        update.message.reply_text("Tu n'as pas encore rejoint la partie.")
+
+# ---------------- FONCTIONS DE GESTION DE PARTIE ---------------- #
+
 def assign_roles():
-    all_roles = roles_ville + roles_bads
+    import random
+    roles_list = list(ROLES.keys())
+    random.shuffle(roles_list)
     player_ids = list(players.keys())
-    random.shuffle(player_ids)
-    random.shuffle(all_roles)
     for i, pid in enumerate(player_ids):
-        players[pid]["role"] = all_roles[i % len(all_roles)]["name"]
+        role = roles_list[i % len(roles_list)]
+        players[pid]["role"] = role
 
-# === START GAME ===
-def start_game(update: Update, context: CallbackContext):
-    global game_started, day_count
-    if game_started:
-        update.message.reply_text("La partie est déjà en cours.")
-        return
-    if len(players) < 5:
-        update.message.reply_text("Au moins 5 joueurs sont nécessaires pour commencer.")
-        return
+def join_timer(bot, chat_id):
+    global join_timer_active
+    join_timer_active = True
+    remaining = JOIN_PHASE_TIME
+    while remaining > 0:
+        time.sleep(5)
+        remaining -= 5
+        if len(players) >= 6:
+            bot.send_message(chat_id, f"6 joueurs ont rejoint ! Utilisez /startgame pour commencer ou attendre {remaining}s.")
+    join_timer_active = False
+    bot.send_message(chat_id, "Temps de rejoins terminé ! Attribution des rôles...")
     assign_roles()
-    game_started = True
-    day_count = 1
-    update.message.reply_text("La partie commence ! Attribution des rôles terminée.")
-    next_day(update, context)
+    start_day_phase(bot, chat_id)
 
-# === PHASES ===
-def next_day(update: Update, context: CallbackContext):
-    global day_count
+def start_join_phase(update: Update, context: CallbackContext):
+    global join_timer_thread
     chat_id = update.effective_chat.id
-    update.message.reply_text(f"Jour {day_count}: Bienvenue dans la ville d'Undercover !")
-    day_phase(context, chat_id)
+    if join_timer_thread and join_timer_thread.is_alive():
+        update.message.reply_text("Le timer de rejoindre est déjà en cours.")
+    else:
+        update.message.reply_text("Le timer de rejoindre a commencé : 2 minutes !")
+        join_timer_thread = threading.Thread(target=join_timer, args=(context.bot, chat_id))
+        join_timer_thread.start()
 
-def day_phase(context: CallbackContext, chat_id):
-    context.bot.send_message(chat_id=chat_id, text="Phase du jour: vous avez 60 secondes pour faire vos actions.")
-    context.job_queue.run_once(defense_phase, 60, context=chat_id)
+# ---------------- PHASES DE JOUR ---------------- #
 
-def defense_phase(context: CallbackContext):
-    chat_id = context.job.context
-    context.bot.send_message(chat_id=chat_id, text="Phase de veille/defense: 45 secondes pour se défendre ou protéger quelqu’un.")
-    context.job_queue.run_once(lynch_phase, 45, context=chat_id)
+def start_day_phase(bot, chat_id):
+    bot.send_message(chat_id, "🌞 Phase du jour : Vous avez 60 secondes pour agir!")
+    threading.Timer(DAY_PHASE_TIME, start_defense_phase, args=(bot, chat_id)).start()
 
-def lynch_phase(context: CallbackContext):
-    chat_id = context.job.context
-    context.bot.send_message(chat_id=chat_id, text="Phase de lynchage: 45 secondes. Le Vexé et les votes sont maintenant résolus.")
-    # Ici, on résout les actions, conversions, Vexé etc.
-    global day_count
-    day_count += 1
+def start_defense_phase(bot, chat_id):
+    bot.send_message(chat_id, "🛡️ Phase de défense : chacun se défend pour ne pas être lynché (45s) !")
+    threading.Timer(DEFENSE_PHASE_TIME, start_lynch_phase, args=(bot, chat_id)).start()
 
-# === ROLE LIST ===
-def role_list(update: Update, context: CallbackContext):
-    keyboard = []
-    for role in roles_ville + roles_bads:
-        keyboard.append([InlineKeyboardButton(role["name"], callback_data=f'role_{role["name"]}')])
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Liste des rôles :", reply_markup=reply_markup)
+def start_lynch_phase(bot, chat_id):
+    bot.send_message(chat_id, "⚖️ Phase de lynchage : votez maintenant (45s) !")
+    threading.Timer(LYNCH_PHASE_TIME, end_turn, args=(bot, chat_id)).start()
 
-def role_callback(update: Update, context: CallbackContext):
-    query = update.callback_query
-    query.answer()
-    role_name = query.data.replace("role_", "")
-    all_roles = {r["name"]: r for r in roles_ville + roles_bads}
-    if role_name in all_roles:
-        role = all_roles[role_name]
-        desc = f"{role['name']} ({role['type']}) - Action: {role['action']}"
-        query.edit_message_text(text=desc)
+def end_turn(bot, chat_id):
+    bot.send_message(chat_id, "✅ La journée est terminée. Préparez-vous pour le prochain tour!")
 
-# === SET LANGUAGE ===
-def set_language(update: Update, context: CallbackContext):
-    update.message.reply_text("Fonctionnalité langue à venir.")
+# ---------------- SETUP BOT ---------------- #
 
-# === MAIN ===
 def main():
-    updater = Updater(TOKEN)
+    updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("join_game", join_game))
-    dp.add_handler(CommandHandler("start_game", start_game))
-    dp.add_handler(CommandHandler("role_list", role_list))
-    dp.add_handler(CommandHandler("set_language", set_language))
-    dp.add_handler(CallbackQueryHandler(role_callback, pattern=r'^role_'))
+    dp.add_handler(CommandHandler("join", join))
+    dp.add_handler(CommandHandler("rolelist", rolelist))
+    dp.add_handler(CommandHandler("setlanguage", setlanguage, pass_args=True))
+    dp.add_handler(CommandHandler("myrole", myrole))
+    dp.add_handler(CommandHandler("points", points))
+    dp.add_handler(CommandHandler("startjoin", start_join_phase))  # démarre le timer 2 min
 
     updater.start_polling()
     updater.idle()
