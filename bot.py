@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, ConversationHandler
 
 # === CONFIG ===
-TOKEN = "TON_TOKEN_ICI"  # Remplace par ton token Telegram
+TOKEN = "8638849486:AAHvSkkd1Gt4oy_PbQb7Q_0wD-JyWoHD3MA"  # Remplace par ton token Telegram
 MAX_POINTS = 20
 
 # === LOGGING ===
