@@ -1,210 +1,143 @@
-import os
+# bot.py
 import random
-from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Updater, CommandHandler, CallbackContext, CallbackQueryHandler, ConversationHandler
 
-TOKEN = os.getenv("TOKEN")
+# === CONFIG ===
+TOKEN = "TON_TOKEN_ICI"  # Remplace par ton token Telegram
+MAX_POINTS = 20
 
-# --- Données ---
-joueurs = {}
-phase = "jour"
+# === LOGGING ===
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
+# === ROLES ===
 roles_ville = [
-    "Civil", "Policier", "Juge", "Avocat",
-    "Maire", "Détective", "Garde rapproché",
-    "Escorte", "Héros"
+    {"name": "Président d’État", "type": "ville", "action": "élimine la secte", "price": 10},
+    {"name": "Juge suprême", "type": "ville", "action": "bloque une action", "price": 6},
+    {"name": "Ministre de la défense", "type": "ville", "action": "protège un joueur", "price": 5},
+    {"name": "Chef de la police", "type": "ville", "action": "coordonne les enquêtes", "price": 5},
+    {"name": "Médecin en chef", "type": "ville", "action": "sauve un rôle clé", "price": 5},
+    {"name": "Détective", "type": "ville", "action": "observe un joueur", "price": 4},
+    {"name": "Enquêteur", "type": "ville", "action": "découvre un rôle", "price": 4},
+    {"name": "Homme blindé", "type": "ville", "action": "protège un joueur", "price": 3},
+    {"name": "Citoyen vigilant", "type": "ville", "action": "observe la journée", "price": 2},
+    {"name": "Simple civil", "type": "ville", "action": None, "price": 0},
+    {"name": "Clochard", "type": "ville", "action": None, "price": 0},
+    {"name": "Secte Mashiil", "type": "ville", "action": "convertit les civils", "price": 4}
 ]
 
 roles_bads = [
-    "Criminel", "Assassin", "Tueur en série", "Maître du temps"
+    {"name": "Chef de gang", "type": "bad", "action": "attaque ou convertit 35%", "price": 8},
+    {"name": "Tueur en série", "type": "bad", "action": "tue un joueur", "price": 6},
+    {"name": "Assassin", "type": "bad", "action": "bloque et tue", "price": 6},
+    {"name": "Criminel", "type": "bad", "action": "soutient les attaques", "price": 5},
+    {"name": "Pyromane", "type": "bad", "action": "attaque aléatoire", "price": 5},
+    {"name": "Espion criminel", "type": "bad", "action": "connaît la cible", "price": 4},
+    {"name": "Voleur", "type": "bad", "action": "échange de rôle", "price": 4},
+    {"name": "Corrompu", "type": "bad", "action": "influence vote", "price": 3},
+    {"name": "Maître du temps", "type": "bad", "action": "avantage de temps", "price": 4},
+    {"name": "Saboteur", "type": "bad", "action": "empêche actions civiques", "price": 3},
+    {"name": "Vexé", "type": "bad", "action": "lynchage automatique", "price": 5}
 ]
 
-roles = roles_ville + roles_bads
+# === JOUEURS ===
+players = {}  # player_id : {name, role, points, tickets, alive}
+game_started = False
+day_count = 0
 
-# --- Commandes ---
+# === COMMANDES DE BASE ===
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🎮 Bienvenue dans Crime & Société\n"
-        "/join pour rejoindre\n"
-        "/startgame pour lancer"
-    )
+    update.message.reply_text("Bienvenue dans Undercover ! Tapez /join_game pour rejoindre la partie.")
 
-def join(update: Update, context: CallbackContext):
-    user = update.message.from_user
+def join_game(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    if user_id not in players:
+        players[user_id] = {"name": update.message.from_user.first_name, "role": None, "points": 0, "tickets": 0, "alive": True}
+        update.message.reply_text(f"{update.message.from_user.first_name} a rejoint la partie !")
+    else:
+        update.message.reply_text("Vous êtes déjà dans la partie.")
 
-    if user.id in joueurs:
-        update.message.reply_text("Tu es déjà dans la partie.")
+# === ATTRIBUTION DES RÔLES ===
+def assign_roles():
+    all_roles = roles_ville + roles_bads
+    player_ids = list(players.keys())
+    random.shuffle(player_ids)
+    random.shuffle(all_roles)
+    for i, pid in enumerate(player_ids):
+        players[pid]["role"] = all_roles[i % len(all_roles)]["name"]
+
+# === START GAME ===
+def start_game(update: Update, context: CallbackContext):
+    global game_started, day_count
+    if game_started:
+        update.message.reply_text("La partie est déjà en cours.")
         return
-
-    role = random.choice(roles)
-    joueurs[user.id] = {
-        "nom": user.first_name,
-        "role": role,
-        "pv": 100,
-        "alive": True,
-        "protect": False,
-        "bonus": 0
-    }
-
-    context.bot.send_message(
-        chat_id=user.id,
-        text=f"🎭 Ton rôle est : {role}"
-    )
-
-    update.message.reply_text(f"{user.first_name} a rejoint la partie.")
-
-def startgame(update: Update, context: CallbackContext):
-    update.message.reply_text("🚀 La partie commence ! Phase JOUR")
-
-def statut(update: Update, context: CallbackContext):
-    user = update.message.from_user
-
-    if user.id not in joueurs:
-        update.message.reply_text("Tu n'es pas dans la partie.")
+    if len(players) < 5:
+        update.message.reply_text("Au moins 5 joueurs sont nécessaires pour commencer.")
         return
+    assign_roles()
+    game_started = True
+    day_count = 1
+    update.message.reply_text("La partie commence ! Attribution des rôles terminée.")
+    next_day(update, context)
 
-    j = joueurs[user.id]
-    update.message.reply_text(
-        f"👤 {j['nom']}\n"
-        f"🎭 {j['role']}\n"
-        f"❤️ PV: {j['pv']}\n"
-        f"💀 Vivant: {j['alive']}"
-    )
+# === PHASES ===
+def next_day(update: Update, context: CallbackContext):
+    global day_count
+    chat_id = update.effective_chat.id
+    update.message.reply_text(f"Jour {day_count}: Bienvenue dans la ville d'Undercover !")
+    day_phase(context, chat_id)
 
-# --- Phase ---
-def phase_cmd(update: Update, context: CallbackContext):
-    global phase
+def day_phase(context: CallbackContext, chat_id):
+    context.bot.send_message(chat_id=chat_id, text="Phase du jour: vous avez 60 secondes pour faire vos actions.")
+    context.job_queue.run_once(defense_phase, 60, context=chat_id)
 
-    phase = "nuit" if phase == "jour" else "jour"
+def defense_phase(context: CallbackContext):
+    chat_id = context.job.context
+    context.bot.send_message(chat_id=chat_id, text="Phase de veille/defense: 45 secondes pour se défendre ou protéger quelqu’un.")
+    context.job_queue.run_once(lynch_phase, 45, context=chat_id)
 
-    update.message.reply_text(f"🌗 Nouvelle phase : {phase.upper()}")
+def lynch_phase(context: CallbackContext):
+    chat_id = context.job.context
+    context.bot.send_message(chat_id=chat_id, text="Phase de lynchage: 45 secondes. Le Vexé et les votes sont maintenant résolus.")
+    # Ici, on résout les actions, conversions, Vexé etc.
+    global day_count
+    day_count += 1
 
-    if phase == "jour":
-        lynch(update)
-        check_win(update)
+# === ROLE LIST ===
+def role_list(update: Update, context: CallbackContext):
+    keyboard = []
+    for role in roles_ville + roles_bads:
+        keyboard.append([InlineKeyboardButton(role["name"], callback_data=f'role_{role["name"]}')])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Liste des rôles :", reply_markup=reply_markup)
 
-# --- Actions ---
-def attaquer(update: Update, context: CallbackContext):
-    user = update.message.from_user
+def role_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+    role_name = query.data.replace("role_", "")
+    all_roles = {r["name"]: r for r in roles_ville + roles_bads}
+    if role_name in all_roles:
+        role = all_roles[role_name]
+        desc = f"{role['name']} ({role['type']}) - Action: {role['action']}"
+        query.edit_message_text(text=desc)
 
-    if user.id not in joueurs or not joueurs[user.id]["alive"]:
-        return
+# === SET LANGUAGE ===
+def set_language(update: Update, context: CallbackContext):
+    update.message.reply_text("Fonctionnalité langue à venir.")
 
-    if joueurs[user.id]["role"] not in roles_bads:
-        update.message.reply_text("❌ Tu ne peux pas attaquer.")
-        return
-
-    try:
-        cible_id = int(context.args[0])
-    except:
-        update.message.reply_text("Usage: /attaquer ID")
-        return
-
-    if cible_id not in joueurs or not joueurs[cible_id]["alive"]:
-        update.message.reply_text("❌ Cible invalide.")
-        return
-
-    if joueurs[cible_id]["protect"]:
-        joueurs[cible_id]["protect"] = False
-        update.message.reply_text("🛡️ Attaque bloquée !")
-        return
-
-    dmg = random.randint(20, 50)
-    joueurs[cible_id]["pv"] -= dmg
-
-    msg = f"⚔️ {joueurs[user.id]['nom']} attaque {joueurs[cible_id]['nom']} ({dmg} dégâts)"
-
-    if joueurs[cible_id]["pv"] <= 0:
-        joueurs[cible_id]["alive"] = False
-        msg += "\n💀 Mort !"
-
-    update.message.reply_text(msg)
-
-def proteger(update: Update, context: CallbackContext):
-    user = update.message.from_user
-
-    if joueurs[user.id]["role"] not in ["Garde rapproché", "Escorte"]:
-        update.message.reply_text("❌ Tu ne peux pas protéger.")
-        return
-
-    try:
-        cible_id = int(context.args[0])
-    except:
-        update.message.reply_text("Usage: /proteger ID")
-        return
-
-    joueurs[cible_id]["protect"] = True
-    update.message.reply_text("🛡️ Protection activée")
-
-def enqueter(update: Update, context: CallbackContext):
-    user = update.message.from_user
-
-    if joueurs[user.id]["role"] != "Détective":
-        update.message.reply_text("❌ Réservé au détective")
-        return
-
-    try:
-        cible_id = int(context.args[0])
-    except:
-        return
-
-    role = joueurs[cible_id]["role"]
-    context.bot.send_message(user.id, f"🔍 Rôle : {role}")
-
-def arreter(update: Update, context: CallbackContext):
-    user = update.message.from_user
-
-    if joueurs[user.id]["role"] != "Policier":
-        return
-
-    cible_id = int(context.args[0])
-    joueurs[cible_id]["alive"] = False
-
-    update.message.reply_text("🚔 Suspect arrêté !")
-
-# --- Lynchs ---
-def lynch(update):
-    vivants = [i for i in joueurs if joueurs[i]["alive"]]
-
-    if not vivants:
-        return
-
-    cible = random.choice(vivants)
-
-    # Héros peut sauver
-    heros = [i for i in joueurs if joueurs[i]["role"] == "Héros" and joueurs[i]["alive"]]
-
-    if heros and random.random() < 0.5:
-        update.message.reply_text("🦸 Le héros sauve la victime !")
-        return
-
-    joueurs[cible]["alive"] = False
-    update.message.reply_text(f"⚖️ {joueurs[cible]['nom']} a été lynché !")
-
-# --- Victoire ---
-def check_win(update):
-    ville = [j for j in joueurs.values() if j["role"] in roles_ville and j["alive"]]
-    bads = [j for j in joueurs.values() if j["role"] in roles_bads and j["alive"]]
-
-    if not ville:
-        update.message.reply_text("🏴 Les criminels gagnent !")
-    elif not bads:
-        update.message.reply_text("🏳️ La ville gagne !")
-
-# --- Main ---
+# === MAIN ===
 def main():
     updater = Updater(TOKEN)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("join", join))
-    dp.add_handler(CommandHandler("startgame", startgame))
-    dp.add_handler(CommandHandler("statut", statut))
-    dp.add_handler(CommandHandler("phase", phase_cmd))
-    dp.add_handler(CommandHandler("attaquer", attaquer))
-    dp.add_handler(CommandHandler("proteger", proteger))
-    dp.add_handler(CommandHandler("enqueter", enqueter))
-    dp.add_handler(CommandHandler("arreter", arreter))
+    dp.add_handler(CommandHandler("join_game", join_game))
+    dp.add_handler(CommandHandler("start_game", start_game))
+    dp.add_handler(CommandHandler("role_list", role_list))
+    dp.add_handler(CommandHandler("set_language", set_language))
+    dp.add_handler(CallbackQueryHandler(role_callback, pattern=r'^role_'))
 
     updater.start_polling()
     updater.idle()
