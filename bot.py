@@ -1,75 +1,224 @@
 import os
+import random
 import threading
 import time
-from telegram import ParseMode, Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from collections import defaultdict
 
-# Token du bot (mettre en variable d'environnement)
-TOKEN = os.environ.get("TOKEN").strip()
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
-# Durées en secondes
-JOIN_PHASE_TIME = 120  # 2 minutes pour rejoindre
-DAY_PHASE_TIME = 60
-DEFENSE_PHASE_TIME = 45
-LYNCH_PHASE_TIME = 45
+TOKEN = os.getenv("TOKEN")
 
-# Exemple de rôles
-ROLES = {
-    "Président": "Dirige la ville et peut protéger certains civils.",
-    "Détective": "Peut enquêter sur un joueur chaque nuit.",
-    "Chef de gang": "Peut convertir un civil à son camp (35% chance).",
-    "Simple Civil": "Pas d’action, juste survivre.",
-    "Secte": "Peut recruter des civils, meurt si va chez un bad."
+players = {}
+game_state = {
+    "started": False,
+    "actions": {},
+    "votes": defaultdict(int)
 }
 
-# Stockage des joueurs et de leurs rôles
-players = {}  # user_id -> {"name": str, "role": str, "points": int}
-join_timer_active = False
-join_timer_thread = None
+ROLES = {
+    "president": {"team": "Ville"},
+    "juge": {"team": "Ville"},
+    "bouclier": {"team": "Ville"},
+    "detective": {"team": "Ville"},
+    "policier": {"team": "Ville"},
+    "citoyen": {"team": "Ville"},
+    "clochard": {"team": "Ville"},
+    "dormeur": {"team": "Ville"},
 
-# ---------------- COMMANDES ---------------- #
+    "chef_gang": {"team": "Gang"},
+    "gang": {"team": "Gang"},
+    "espion": {"team": "Gang"},
 
-def start(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "Bienvenue dans Undercover! Utilise /join pour rejoindre la partie.\n"
-        "Le timer pour rejoindre est de 2 minutes. Une fois 6 joueurs minimum, on peut forcer le début."
-    )
+    "secte": {"team": "Secte"},
+
+    "tueur": {"team": "Solo"},
+    "assassin": {"team": "Solo"},
+    "baron": {"team": "Solo"},
+
+    "vexe": {"team": "Ville"}
+}
+
+# ================= JOIN ================= #
 
 def join(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    name = update.message.from_user.first_name
-    if user_id in players:
-        update.message.reply_text("Tu as déjà rejoint la partie!")
-    else:
-        players[user_id] = {"name": name, "role": None, "points": 0}
-        update.message.reply_text(f"{name} a rejoint la partie! Joueurs totaux: {len(players)}")
+    user = update.message.from_user
+    players[user.id] = {"name": user.first_name, "role": None, "alive": True, "points": 0}
+    update.message.reply_text(f"{user.first_name} rejoint ({len(players)})")
 
-def rolelist(update: Update, context: CallbackContext):
-    msg = "*Liste des rôles :*\n"
-    for role, desc in ROLES.items():
-        msg += f"• *{role}* : {desc}\n"
-    update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+# ================= ROLE ASSIGN ================= #
 
-def setlanguage(update: Update, context: CallbackContext):
-    if context.args:
-        lang = context.args[0].lower()
-        update.message.reply_text(f"Langue changée en {lang}")
-    else:
-        update.message.reply_text("Usage: /setlanguage <fr/en>")
+def assign_roles(bot):
+    ids = list(players.keys())
+    random.shuffle(ids)
 
-def myrole(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    if user_id in players and players[user_id]["role"]:
-        update.message.reply_text(f"Ton rôle est : {players[user_id]['role']}")
-    else:
-        update.message.reply_text("Tu n'as pas encore reçu de rôle.")
+    roles = list(ROLES.keys())
+    while len(roles) < len(ids):
+        roles.append("citoyen")
 
-def points(update: Update, context: CallbackContext):
-    user_id = update.message.from_user.id
-    if user_id in players:
-        update.message.reply_text(f"Tu as {players[user_id]['points']} points.")
-    else:
-        update.message.reply_text("Tu n'as pas encore rejoint la partie.")
+    random.shuffle(roles)
+
+    for i, uid in enumerate(ids):
+        role = roles[i]
+        players[uid]["role"] = role
+        bot.send_message(uid, f"🎭 Ton rôle : {role}")
+
+# ================= NIGHT ================= #
+
+def night_phase(bot, chat_id):
+    game_state["actions"] = {}
+
+    for uid, p in players.items():
+        if not p["alive"]:
+            continue
+
+        role = p["role"]
+
+        if role in ["chef_gang", "gang", "tueur", "assassin"]:
+            send_action(bot, uid, "kill")
+
+        elif role == "bouclier":
+            send_action(bot, uid, "protect")
+
+        elif role == "detective":
+            send_action(bot, uid, "inspect")
+
+        elif role == "espion":
+            send_action(bot, uid, "spy")
+
+        elif role == "secte":
+            send_action(bot, uid, "convert")
+
+    bot.send_message(chat_id, "🌙 Nuit en cours (45s)")
+    time.sleep(45)
+
+    resolve_night(bot, chat_id)
+
+def send_action(bot, uid, action_type):
+    buttons = []
+    for target_id, p in players.items():
+        if p["alive"] and target_id != uid:
+            buttons.append([InlineKeyboardButton(p["name"], callback_data=f"{action_type}:{target_id}")])
+
+    bot.send_message(uid, f"Choisis une cible ({action_type})", reply_markup=InlineKeyboardMarkup(buttons))
+
+# ================= HANDLE ACTION ================= #
+
+def action_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+
+    action, target = query.data.split(":")
+    user = query.from_user.id
+
+    game_state["actions"][user] = (action, int(target))
+    query.edit_message_text("✅ Action enregistrée")
+
+# ================= RESOLUTION ================= #
+
+def resolve_night(bot, chat_id):
+    protected = set()
+    deaths = set()
+
+    for uid, (action, target) in game_state["actions"].items():
+        role = players[uid]["role"]
+
+        if action == "protect":
+            protected.add(target)
+
+    for uid, (action, target) in game_state["actions"].items():
+        role = players[uid]["role"]
+
+        if action == "kill":
+            if target not in protected:
+                deaths.add(target)
+
+        elif action == "convert":
+            if players[target]["role"] == "citoyen":
+                players[target]["role"] = "secte"
+
+    for d in deaths:
+        players[d]["alive"] = False
+
+    msg = "☀️ Résultat nuit:\n"
+    for d in deaths:
+        msg += f"💀 {players[d]['name']} est mort\n"
+
+    bot.send_message(chat_id, msg)
+
+# ================= DAY ================= #
+
+def day_phase(bot, chat_id):
+    bot.send_message(chat_id, "🌞 Jour (60s discussion)")
+    time.sleep(60)
+
+    vote_phase(bot, chat_id)
+
+# ================= VOTE ================= #
+
+def vote_phase(bot, chat_id):
+    game_state["votes"].clear()
+
+    buttons = []
+    for uid, p in players.items():
+        if p["alive"]:
+            buttons.append([InlineKeyboardButton(p["name"], callback_data=f"vote:{uid}")])
+
+    bot.send_message(chat_id, "⚖️ Votez :", reply_markup=InlineKeyboardMarkup(buttons))
+    time.sleep(45)
+
+    resolve_votes(bot, chat_id)
+
+def vote_handler(update: Update, context: CallbackContext):
+    query = update.callback_query
+    query.answer()
+
+    target = int(query.data.split(":")[1])
+    game_state["votes"][target] += 1
+
+def resolve_votes(bot, chat_id):
+    if not game_state["votes"]:
+        bot.send_message(chat_id, "❌ Aucun vote")
+        return
+
+    victim = max(game_state["votes"], key=game_state["votes"].get)
+    players[victim]["alive"] = False
+
+    bot.send_message(chat_id, f"☠️ {players[victim]['name']} a été lynché")
+
+# ================= GAME LOOP ================= #
+
+def game_loop(bot, chat_id):
+    while True:
+        night_phase(bot, chat_id)
+        day_phase(bot, chat_id)
+
+# ================= START ================= #
+
+def startgame(update: Update, context: CallbackContext):
+    if len(players) < 6:
+        update.message.reply_text("Minimum 6 joueurs")
+        return
+
+    assign_roles(context.bot)
+    threading.Thread(target=game_loop, args=(context.bot, update.effective_chat.id)).start()
+
+# ================= MAIN ================= #
+
+def main():
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("join", join))
+    dp.add_handler(CommandHandler("startgame", startgame))
+    dp.add_handler(CallbackQueryHandler(action_handler, pattern="^(kill|protect|inspect|spy|convert):"))
+    dp.add_handler(CallbackQueryHandler(vote_handler, pattern="^vote:"))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()        update.message.reply_text("Tu n'as pas encore rejoint la partie.")
 
 # ---------------- FONCTIONS DE GESTION DE PARTIE ---------------- #
 
