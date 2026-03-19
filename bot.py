@@ -1,75 +1,161 @@
-import os
-import random
+# bot.py
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
+import random
+import datetime
 
-# Token
-TOKEN = os.getenv("TOKEN")
+# =========================
+# CONFIGURATION
+# =========================
+TOKEN = "TON_TOKEN_ICI"  # Remplace par ton vrai token
+LANGS = ["fr", "en"]
+DEFAULT_LANG = "fr"
 
-# Stockage RAM
-game_state = {
-    "players": {},  # id -> {name, alive, role, points, team}
-    "phase": "waiting",
-    "language": "fr",
-    "day": 1,
-    "lynch_queue": []
+# Stockage simple en RAM
+GAME = {
+    "players": {},       # player_id: {"name": str, "role": str, "alive": bool, "points": int}
+    "roles": {},         # role_name: {"team": str, "emoji": str, "description": str, "action": callable}
+    "phase": "waiting",  # waiting, day, defense, lynch
+    "day_number": 0,
+    "language": DEFAULT_LANG,
+    "join_timer": None
 }
 
-MAX_POINTS = 35
-
-# Rôles avec emoji, description, team (ville/bad/solitaire)
-ROLES = {
-    # Civils
-    "Président": {"emoji":"🧑‍💼","desc":"Dirige la ville, coordonne le comité exécutif.","team":"ville"},
-    "ComitéExécutif": {"emoji":"🏛️","desc":"Protège la ville, aide le président.","team":"ville"},
-    "Bouclier": {"emoji":"🛡️","desc":"Protège un membre du comité exécutif.","team":"ville"},
-    "Citoyen": {"emoji":"🧑","desc":"Civil simple.","team":"ville"},
-    "Clochard": {"emoji":"🪤","desc":"Civil passif.","team":"ville"},
-    "HommeBlindé": {"emoji":"🛡️","desc":"Peut bloquer une attaque la nuit (faible chance).","team":"ville"},
-    "Detective": {"emoji":"🕵️","desc":"Peut enquêter sur certains rôles.","team":"ville"},
-    "Vexe": {"emoji":"😈","desc":"Lynche automatiquement, meurt si lynche mal.","team":"ville"},
-
+# =========================
+# DEFINITION DES ROLES
+# =========================
+# Les civils
+GAME["roles"] = {
+    "Président": {
+        "team": "ville", "emoji": "🏛️", 
+        "description": "Dirige la ville, peut coordonner le comité exécutif.", "action": None
+    },
+    "Bouclier administratif": {
+        "team": "ville", "emoji": "🛡️",
+        "description": "Protège un membre du comité exécutif.", "action": None
+    },
+    "Citoyen": {
+        "team": "ville", "emoji": "👨‍👩‍👧", 
+        "description": "Civil simple, aucun pouvoir particulier.", "action": None
+    },
+    "Clochard": {
+        "team": "ville", "emoji": "🪤", 
+        "description": "Civil simple sans action.", "action": None
+    },
+    "Enquêteur": {
+        "team": "ville", "emoji": "🕵️", 
+        "description": "Peut enquêter sur une personne chaque nuit.", "action": None
+    },
+    "Détective": {
+        "team": "ville", "emoji": "🕵️‍♂️", 
+        "description": "Peut découvrir des membres du gang ou la secte.", "action": None
+    },
+    # Gangs et criminels
+    "Chef de gang": {
+        "team": "bad", "emoji": "💀",
+        "description": "Dirige le gang, peut convertir des civils à 35%.", "action": None
+    },
+    "Gang premier rang": {
+        "team": "bad", "emoji": "🔪",
+        "description": "Membre du gang.", "action": None
+    },
+    "Passeur": {
+        "team": "bad", "emoji": "📡",
+        "description": "Collecte des indices sur le comité exécutif.", "action": None
+    },
+    "Baron de drogue": {
+        "team": "bad", "emoji": "💊",
+        "description": "Travaille seul, distribue de la drogue et risque de se faire repérer par le juge.", "action": None
+    },
     # Secte
-    "Prêtre": {"emoji":"⛪","desc":"50% de chance de mourir chez un bad, bloque conversion si survit.","team":"secte"},
-    "Croyant": {"emoji":"📿","desc":"Convertit un joueur 25-35%.","team":"secte"},
-    "Secte": {"emoji":"🔮","desc":"Convertit des civils, existe si >=15 joueurs.","team":"secte"},
-
-    # Gang
-    "GangChef": {"emoji":"👑","desc":"Chef du gang, conversion 35% sur civils.","team":"bad"},
-    "GangMembre": {"emoji":"🕴️","desc":"Membre du gang de premier rang.","team":"bad"},
-    "Passeur": {"emoji":"📦","desc":"Collecte indices sur comité exécutif (faible chance).","team":"bad"},
-    "BaronDrogue": {"emoji":"💰","desc":"Travaille seul, peut gêner détective/juges.","team":"bad"},
-
-    # Tueurs
-    "TueurSerie": {"emoji":"🔪","desc":"Tue solitaire, gagne seul.","team":"bad"},
-    "Assassin": {"emoji":"🗡️","desc":"Tue le jour, >35 joueurs, ne trahit pas tueur en série.","team":"bad"},
-    "Espion": {"emoji":"🕵️‍♂️","desc":"Récolte infos sur le comité exécutif uniquement.","team":"bad"}
+    "Secte Mashiil": {
+        "team": "bad", "emoji": "🕉️",
+        "description": "Peut convertir des civils, apparaît seulement si >=15 joueurs.", "action": None
+    },
+    "Prêtre": {
+        "team": "bad", "emoji": "⛪",
+        "description": "Risque 50% de mourir lorsqu'il visite un mauvais rôle.", "action": None
+    },
+    "Croyant de premier rang": {
+        "team": "bad", "emoji": "🙏",
+        "description": "Peut convertir un membre du comité exécutif avec 25-30% de chance.", "action": None
+    },
+    # Tueurs solitaires
+    "Tueur en série": {
+        "team": "bad", "emoji": "🔪",
+        "description": "Gagne seul, solitaire.", "action": None
+    },
+    "Assassin": {
+        "team": "bad", "emoji": "🗡️",
+        "description": "Tue pendant le jour, nécessite >=35 joueurs.", "action": None
+    },
+    "Espion": {
+        "team": "bad", "emoji": "🕵️‍♂️",
+        "description": "Peut découvrir les membres du comité exécutif uniquement.", "action": None
+    },
+    # Vexe
+    "Vexe": {
+        "team": "ville", "emoji": "⚡",
+        "description": "Lorsqu'il lynche, le lynchage est automatique, gagne avec la ville.", "action": None
+    }
 }
 
-# ----------------------------
-# Commandes Telegram
-# ----------------------------
+# =========================
+# COMMANDES DE BASE
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bienvenue dans UndercoverBot!\nUtilisez /join pour rejoindre la partie."
-    )
+    await update.message.reply_text("Bienvenue! Tapez /joingame pour rejoindre la partie.")
 
-async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def joingame(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
-    if user_id not in game_state["players"]:
-        game_state["players"][user_id] = {"name": update.message.from_user.first_name, "alive": True, "role": None, "points":0,"team":None}
-        await update.message.reply_text(f"{update.message.from_user.first_name} a rejoint la partie!")
+    if user_id not in GAME["players"]:
+        GAME["players"][user_id] = {
+            "name": update.message.from_user.first_name,
+            "role": None,
+            "alive": True,
+            "points": 0
+        }
+        await update.message.reply_text(f"{update.message.from_user.first_name} a rejoint la partie.")
     else:
-        await update.message.reply_text("Vous avez déjà rejoint la partie!")
+        await update.message.reply_text("Vous êtes déjà dans la partie.")
 
-async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        lang = context.args[0]
-        game_state["language"] = lang
-        await update.message.reply_text(f"Langue définie sur {lang}.")
+async def rolelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = ""
+    keyboard = []
+    for role, info in GAME["roles"].items():
+        text += f"{info['emoji']} {role}\n"
+        keyboard.append([InlineKeyboardButton("Info", callback_data=f"info_{role}")])
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def setlanguage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0] in LANGS:
+        GAME["language"] = context.args[0]
+        await update.message.reply_text(f"Langue définie sur {context.args[0]}")
     else:
-        await update.message.reply_text("Usage: /setlanguage <code_langue>")
+        await update.message.reply_text("Langue non supportée.")
+
+async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    role_name = query.data.replace("info_", "")
+    info = GAME["roles"].get(role_name, None)
+    if info:
+        await query.message.reply_text(f"{info['emoji']} {role_name}\nTeam: {info['team']}\n{info['description']}")
+
+# =========================
+# LANCER LE BOT
+# =========================
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("joingame", joingame))
+    app.add_handler(CommandHandler("rolelist", rolelist))
+    app.add_handler(CommandHandler("setlanguage", setlanguage))
+    app.add_handler(CallbackQueryHandler(info_callback, pattern="^info_"))
+
+    print("Bot lancé...")
+    app.run_polling()        await update.message.reply_text("Usage: /setlanguage <code_langue>")
 
 async def rolelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = [[InlineKeyboardButton(f"{r['emoji']} {role}", callback_data=f"about_{role}")] for role,r in ROLES.items()]
