@@ -133,7 +133,8 @@ async def setlanguage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         GAME["language"] = context.args[0]
         await update.message.reply_text(f"Langue définie sur {context.args[0]}")
     else:
-        await update.message.reply_text("Langue non supportée.")
+        # Ici, on ne met QUE l'await, pas sur la même ligne qu'autre chose
+        await update.message.reply_text("Usage: /setlanguage <code_langue>")
 
 async def info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
