@@ -1,75 +1,136 @@
-import os
 import random
-import threading
-import time
-from collections import defaultdict
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
+# ====== CONFIG ======
+TOKEN = "8638849486:AAHvSkkd1Gt4oy_PbQb7Q_0wD-JyWoHD3MA"
+LANGUAGES = ["fr", "en"]
+DEFAULT_LANGUAGE = "fr"
+JOIN_TIMER = 120  # secondes
+MIN_PLAYERS = 6
 
-TOKEN = os.getenv("TOKEN")
+# ====== STOCKAGE EN RAM ======
+players = {}  # {user_id: {"name": ..., "role": ..., "points": 0, "status": "alive"}}
+game_phase = "waiting"
+roles = []
 
-players = {}
-game_state = {
-    "started": False,
-    "actions": {},
-    "votes": defaultdict(int)
-}
+# ====== ROLES DÉTAILLÉS AVEC ACTIONS ======
+roles = [
+    # COMITÉ EXÉCUTIF
+    {"name": "Président", "emoji": "👑", "camp": "city", "description": "Gère la ville. Protège les civils.", "chance_if_secte": 0.4, "action": "découvrir la secte ou bat"},
+    {"name": "Bouclier administratif", "emoji": "🛡️", "camp": "city", "description": "Protège un membre du comité chaque nuit.", "action": "protection"},
+    {"name": "Ministre de la Défense", "emoji": "⚔️", "camp": "city", "description": "Bloque une attaque sur un membre de la ville.", "action": "protection"},
 
-ROLES = {
-    "president": {"team": "Ville"},
-    "juge": {"team": "Ville"},
-    "bouclier": {"team": "Ville"},
-    "detective": {"team": "Ville"},
-    "policier": {"team": "Ville"},
-    "citoyen": {"team": "Ville"},
-    "clochard": {"team": "Ville"},
-    "dormeur": {"team": "Ville"},
+    # CIVILS
+    {"name": "Citoyen", "emoji": "👨", "camp": "city", "description": "Civil simple. Aucun pouvoir spécial.", "points_range": (5,10)},
+    {"name": "Clochard", "emoji": "🪤", "camp": "city", "description": "Civil simple, aucun pouvoir.", "points_range": (5,10)},
+    {"name": "Enquêteur", "emoji": "🕵️", "camp": "city", "description": "Peut découvrir l'identité d'un joueur par nuit.", "action": "enquête", "points_range": (10,25)},
+    {"name": "Détective", "emoji": "🕵️‍♂️", "camp": "city", "description": "Découvre un joueur et bloque certaines actions.", "action": "enquête", "points_range": (10,25)},
+    {"name": "Vexe", "emoji": "🎯", "camp": "city", "description": "Lynche automatiquement une cible par jour.", "action": "lynch", "points_range": (15,35)},
 
-    "chef_gang": {"team": "Gang"},
-    "gang": {"team": "Gang"},
-    "espion": {"team": "Gang"},
+    # BAT / GANGS
+    {"name": "Chef de gang", "emoji": "🦹", "camp": "bad", "description": "Peut convertir un civil 35% du temps.", "action": "convertir"},
+    {"name": "Membre de gang", "emoji": "👺", "camp": "bad", "description": "Suivi du chef, attaque avec le gang.", "action": "attaque"},
+    {"name": "Passeur", "emoji": "🕴️", "camp": "bad", "description": "Recueille des indices sur les membres du comité.", "action": "espionnage"},
+    {"name": "Baron de drogue", "emoji": "💊", "camp": "bad", "description": "Travaille seul mais gagne avec le gang.", "action": "attaque"},
 
-    "secte": {"team": "Secte"},
+    # SECTE
+    {"name": "Secte", "emoji": "☠️", "camp": "bad", "description": "Peut convertir un civil uniquement si ≥15 joueurs.", "action": "convertir"},
+    {"name": "Prêtre secte", "emoji": "🙏", "camp": "bad", "description": "50% de chances de mourir lorsqu'il agit sur un civil.", "action": "convertir"},
+    {"name": "Croyant de premier rang", "emoji": "🪄", "camp": "bad", "description": "25-30% de chance de convertir un membre du comité.", "action": "convertir"},
 
-    "tueur": {"team": "Solo"},
-    "assassin": {"team": "Solo"},
-    "baron": {"team": "Solo"},
+    # TUEUR / ASSASSIN
+    {"name": "Tueur en série", "emoji": "🔪", "camp": "bad", "description": "Agit seul, ne gagne pas avec le gang.", "action": "attaque"},
+    {"name": "Assassin", "emoji": "🥷", "camp": "bad", "description": "Attaque le jour, ne se trahit pas avec le tueur en série.", "action": "attaque"},
 
-    "vexe": {"team": "Ville"}
-}
+    # ESPION
+    {"name": "Espion", "emoji": "🕵️‍♀️", "camp": "bad", "description": "Peut espionner le comité exécutif uniquement.", "action": "espionnage"},
+]
 
-# ================= JOIN ================= #
+# ====== COMMANDES ======
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bienvenue au jeu Undercover! Utilisez /join pour rejoindre la partie.")
 
-def join(update: Update, context: CallbackContext):
-    user = update.message.from_user
-    players[user.id] = {"name": user.first_name, "role": None, "alive": True, "points": 0}
-    update.message.reply_text(f"{user.first_name} rejoint ({len(players)})")
+async def join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in players:
+        players[user.id] = {"name": user.first_name, "role": None, "points": 0, "status": "alive"}
+        await update.message.reply_text(f"{user.first_name} a rejoint la partie!")
+    else:
+        await update.message.reply_text(f"{user.first_name}, vous êtes déjà dans la partie.")
 
-# ================= ROLE ASSIGN ================= #
+async def rolelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [[InlineKeyboardButton(f"{role['emoji']} {role['name']}", callback_data=f"info_{role['name']}")] for role in roles]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Liste des rôles :", reply_markup=reply_markup)
 
-def assign_roles(bot):
-    ids = list(players.keys())
-    random.shuffle(ids)
+async def about_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    role_name = query.data.split("_")[1]
+    role = next((r for r in roles if r["name"] == role_name), None)
+    if role:
+        await query.message.reply_text(f"{role['emoji']} {role['name']}\nCamp: {role['camp']}\nDescription: {role['description']}\nAction: {role.get('action','Aucune')}")
 
-    roles = list(ROLES.keys())
-    while len(roles) < len(ids):
-        roles.append("citoyen")
+async def setlanguage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0] in LANGUAGES:
+        context.user_data["lang"] = context.args[0]
+        await update.message.reply_text(f"Langue définie sur {context.args[0]}")
+    else:
+        await update.message.reply_text("Langues disponibles: fr, en")
 
-    random.shuffle(roles)
+# ====== FONCTIONS DE JEU ======
+def assign_roles():
+    player_ids = list(players.keys())
+    random.shuffle(player_ids)
+    for i, pid in enumerate(player_ids):
+        if len(player_ids) >= 15 and i == 0:
+            players[pid]["role"] = next(r for r in roles if r["name"] == "Secte")
+        else:
+            players[pid]["role"] = random.choice(roles)
 
-    for i, uid in enumerate(ids):
-        role = roles[i]
-        players[uid]["role"] = role
-        bot.send_message(uid, f"🎭 Ton rôle : {role}")
+async def start_game(context: ContextTypes.DEFAULT_TYPE):
+    global game_phase
+    if len(players) < MIN_PLAYERS:
+        return
+    assign_roles()
+    game_phase = "night"
+    await broadcast("Le jeu commence! Phase de nuit pour 2 minutes.")
+    await asyncio.sleep(JOIN_TIMER)
+    await night_phase()
 
-# ================= NIGHT ================= #
+async def broadcast(message):
+    for pid in players:
+        try:
+            await context.bot.send_message(chat_id=pid, text=message)
+        except:
+            pass
 
-def night_phase(bot, chat_id):
-    game_state["actions"] = {}
+async def night_phase():
+    global game_phase
+    game_phase = "night"
+    await broadcast("Phase de nuit: tout le monde agit...")
+    await asyncio.sleep(60)
+    await day_phase()
 
-    for uid, p in players.items():
-        if not p["alive"]:
+async def day_phase():
+    global game_phase
+    game_phase = "day"
+    await broadcast("Phase de jour: lynchage possible!")
+    await asyncio.sleep(60)
+    await night_phase()
+
+# ====== APPLICATION ======
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("join", join))
+app.add_handler(CommandHandler("rolelist", rolelist))
+app.add_handler(CommandHandler("setlanguage", setlanguage))
+app.add_handler(CallbackQueryHandler(about_role, pattern=r"^info_"))
+
+print("Bot prêt à démarrer...")
+app.run_polling()        if not p["alive"]:
             continue
 
         role = p["role"]
